@@ -1,0 +1,13 @@
+# Inventory files contain sensitive data (IPs, usernames, key paths)
+inventory.ini
+**/inventory.ini
+
+# Ansible retry files
+*.retry
+
+# Logs
+*.log
+
+# Local test files
+test/
+.vagrant/

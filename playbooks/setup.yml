@@ -1,0 +1,239 @@
+---
+- name: Base VPS hardening and setup (run as root on port 22)
+  hosts: all
+  become: yes
+  # Variables defined in inventory.ini:
+  # - admin_user: Admin user to create (default: hostdog)
+  # - ssh_port: SSH port to migrate to (default: 2244)
+  # - ssh_key_path: Path to SSH public key file
+
+  tasks:
+    - name: Create admin user
+      user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        create_home: yes
+        state: present
+
+    - name: Add admin user to sudoers with NOPASSWD
+      lineinfile:
+        path: /etc/sudoers.d/{{ admin_user }}
+        line: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL"
+        create: yes
+        mode: '0440'
+        validate: 'visudo -cf %s'
+
+    - name: Setup SSH key for admin user
+      authorized_key:
+        user: "{{ admin_user }}"
+        key: "{{ lookup('file', ssh_key_path) }}"
+        state: present
+
+    - name: Update apt
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install packages
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - unzip
+          - curl
+          - wget
+          - git
+          - rsync
+        state: present
+
+    - name: Backup original sshd_config
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.backup
+        remote_src: yes
+        force: no
+
+    - name: Check if already using custom SSH port
+      shell: "grep -E '^Port {{ ssh_port }}$' /etc/ssh/sshd_config"
+      register: ssh_port_check
+      ignore_errors: yes
+      changed_when: false
+
+    # SSH Migration Phase 1: Dual-port configuration
+    - name: Configure SSH - Add both ports temporarily (22 and {{ ssh_port }})
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED - DUAL PORT TRANSITION"
+        insertafter: "^#Port 22"
+        block: |
+          Port 22
+          Port {{ ssh_port }}
+      when: ssh_port_check.rc != 0
+
+    - name: Configure SSH - Disable root login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+
+    - name: Configure SSH - Disable password authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+
+    - name: Configure SSH - Enable pubkey authentication
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+        state: present
+
+    - name: Restart SSH to apply dual-port config
+      systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_check.rc != 0
+
+    # UFW Configuration - Add rules but DON'T enable yet
+    - name: UFW - Allow SSH on new port {{ ssh_port }}
+      ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+        comment: 'SSH custom port'
+
+    - name: UFW - Allow HTTP
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+        comment: 'HTTP'
+
+    - name: UFW - Allow HTTPS
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+        comment: 'HTTPS'
+
+    - name: UFW - Set default policies
+      ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    # CRITICAL: Disable ssh.socket to prevent systemd from overriding Port config
+    # ssh.socket hardcodes port 22, we need standalone SSH daemon
+    - name: Stop and disable ssh.socket (if exists)
+      systemd:
+        name: ssh.socket
+        state: stopped
+        enabled: no
+      when: ssh_port_check.rc != 0
+      ignore_errors: yes
+
+    - name: Restart SSH to apply dual-port config
+      systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_check.rc != 0
+
+    - name: Wait for SSH to bind to ports (5 second pause)
+      pause:
+        seconds: 5
+      when: ssh_port_check.rc != 0
+
+    - name: Verify new SSH port is reachable
+      wait_for:
+        port: "{{ ssh_port }}"
+        host: "{{ inventory_hostname }}"
+        delay: 2
+        timeout: 30
+      delegate_to: localhost
+      become: no
+      when: ssh_port_check.rc != 0
+
+    # NOW safe to enable UFW - SSH is confirmed working
+    - name: UFW - Enable firewall (after SSH confirmed working)
+      ufw:
+        state: enabled
+
+    # SSH Migration Phase 2: Finalize to custom port only
+    - name: Remove old SSH port 22 from config (finalize hardening)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Port 22$'
+        state: absent
+      when: ssh_port_check.rc != 0
+
+    - name: Remove dual-port marker block
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED - DUAL PORT TRANSITION"
+        state: absent
+      when: ssh_port_check.rc != 0
+
+    - name: Set final SSH port in config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?Port'
+        line: "Port {{ ssh_port }}"
+        state: present
+      when: ssh_port_check.rc != 0
+
+    - name: Final SSH restart on new port only
+      systemd:
+        name: ssh
+        state: restarted
+      when: ssh_port_check.rc != 0
+
+    - name: Wait for final SSH port
+      pause:
+        seconds: 3
+      when: ssh_port_check.rc != 0
+
+    - name: Update ansible_port for remaining tasks
+      set_fact:
+        ansible_port: "{{ ssh_port }}"
+      when: ssh_port_check.rc != 0
+
+    - name: UFW - Remove old SSH port 22
+      ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+        delete: yes
+      when: ssh_port_check.rc != 0
+      ignore_errors: yes
+
+    - name: Configure fail2ban for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+          findtime = 600
+        mode: '0644'
+      notify: Restart fail2ban
+
+    - name: Enable fail2ban
+      systemd:
+        name: fail2ban
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: Restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
